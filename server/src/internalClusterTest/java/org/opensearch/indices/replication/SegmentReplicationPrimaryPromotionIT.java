@@ -26,6 +26,7 @@
  */
 package org.opensearch.indices.replication;
 
+import org.junit.Before;
 import org.opensearch.action.ActionFuture;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.index.IndexResponse;
@@ -39,12 +40,13 @@ import org.opensearch.test.InternalTestCluster;
 import org.opensearch.test.OpenSearchIntegTestCase;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertHitCount;
 
-@OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 2)
+@OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
 public class SegmentReplicationPrimaryPromotionIT extends SegmentReplicationBaseIT {
 
     @Override
@@ -52,12 +54,19 @@ public class SegmentReplicationPrimaryPromotionIT extends SegmentReplicationBase
         return false;
     }
 
+    @Before
+    private void setup() {
+        internalCluster().startClusterManagerOnlyNode();
+    }
+
     public void testPromoteReplicaToPrimary() throws Exception {
-        String[] dataNodeNames = getClusterState().nodes().getDataNodes().values().stream().map(DiscoveryNode::getName).toArray(String[]::new);
-        assertEquals(2, dataNodeNames.length);
+        final String primary = internalCluster().startDataOnlyNode();
         final String indexName = INDEX_NAME;
         createIndexInternal(indexName);
+        ensureYellowAndNoInitializingShards(INDEX_NAME);
+        final String replica = internalCluster().startDataOnlyNode();
         ensureGreen();
+        assertEquals(primary, getNodeContainingPrimaryShard().getName());
 
         final int numOfDocs = 3;
         List<ActionFuture<IndexResponse>> responses = new ArrayList<>();
@@ -69,23 +78,12 @@ public class SegmentReplicationPrimaryPromotionIT extends SegmentReplicationBase
                 refresh(indexName);
             }
         );
-        waitForSearchableDocs(numOfDocs, dataNodeNames);
-
-        // pick up a data node that contains a random primary shard
-        ClusterState state = client(internalCluster().getMasterName()).admin().cluster().prepareState().get().getState();
-        final ShardRouting primaryShard = state.routingTable().index(indexName).shard(0).primaryShard();
-        final ShardRouting replicaShard = state.routingTable().index(indexName).shard(0).replicaShards().get(0);
-        final DiscoveryNode primaryNode = state.nodes().resolveNode(primaryShard.currentNodeId());
-        final DiscoveryNode replicaNode = state.nodes().resolveNode(replicaShard.currentNodeId());
-
-        internalCluster().stopRandomNode(InternalTestCluster.nameFilter(primaryNode.getName()));
+        waitForSearchableDocs(numOfDocs, new String[]{primary, replica});
+        internalCluster().stopRandomNode(InternalTestCluster.nameFilter(primary));
         ensureYellowAndNoInitializingShards(indexName);
-        final DiscoveryNode newPrimaryNode = replicaNode;
-
-        state = client(internalCluster().getMasterName()).admin().cluster().prepareState().get().getState();
-        ShardRouting newPrimaryShardRouting = state.routingTable().index(indexName).shards().get(0).primaryShard();
-        assertEquals(newPrimaryNode.getId(), newPrimaryShardRouting.currentNodeId());
-        assertHitCount(client().prepareSearch(indexName).setSize(0).get(), numOfDocs);
+        assertEquals(replica, getNodeContainingPrimaryShard().getName());
+        assertHitCount(client(replica).prepareSearch(indexName).setPreference("_only_local").setSize(0).get(), numOfDocs);
+//        waitForSearchableDocs(numOfDocs, replica);
     }
 
     private void createIndexInternal(String index) {
